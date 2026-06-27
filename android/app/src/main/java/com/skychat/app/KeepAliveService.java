@@ -1,0 +1,725 @@
+package com.skychat.app;
+
+import android.app.AlarmManager;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.app.Service;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.media.RingtoneManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.os.Build;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.os.SystemClock;
+import android.util.Log;
+
+import androidx.core.app.NotificationCompat;
+import androidx.core.app.Person;
+import androidx.core.graphics.drawable.IconCompat;
+
+import org.json.JSONObject;
+
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+
+import java.util.concurrent.TimeUnit;
+
+public class KeepAliveService extends Service {
+
+    private static final String TAG = "KeepAlive";
+    private static final String CHANNEL_ID = "skychat_bg_v3";
+    private static final String CHANNEL_CALL = "skychat_calls";
+    private static final String CHANNEL_MSG = "skychat_messages";
+
+    // ✅ FIXED: purana duckdns domain change karke skyfinancia.com kiya
+    private static final String WS_BASE = "wss://skyfinancia.com/ws/chat/";
+    private static final String BASE_URL = "https://skyfinancia.com";
+
+    public static final String PREFS_NAME = "skychat_prefs";
+
+    public static KeepAliveService instance = null;
+
+    private PowerManager.WakeLock wakeLock;
+    private OkHttpClient httpClient;
+    private WebSocket webSocket;
+    private Handler reconnectHandler;
+    private boolean isRunning = false;
+    private int reconnectDelay = 3000;
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private boolean isConnecting = false;
+    private Handler aliveCheckHandler;
+    private static final long ALIVE_CHECK_INTERVAL = 45000;
+    private long lastPongTime = 0;
+
+    private int lastCallId = -1;
+    private int lastCallerId = -1;
+    private Runnable callTimeoutRunnable = null;
+    private static final long CALL_RING_TIMEOUT = 45000;
+    private static final String PREF_ACTIVE_CALL_ID = "active_call_id";
+    private static final String PREF_CALL_HANDLED = "call_handled";
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        instance = this;
+        Log.d(TAG, "Service onCreate");
+        reconnectHandler = new Handler(Looper.getMainLooper());
+        createChannels();
+
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("SkyChat")
+            .setContentText("")
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .setSilent(true)
+            .setShowWhen(false)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build();
+
+        if (Build.VERSION.SDK_INT >= 34) { // Android 14+
+    startForeground(1, notification,
+        android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC |
+        android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE |
+        android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+} else {
+    startForeground(1, notification);
+}
+
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "skychat:keepalive");
+        wakeLock.acquire();
+
+        registerNetworkCallback();
+
+        isRunning = true;
+        aliveCheckHandler = new Handler(Looper.getMainLooper());
+        connectWebSocket();
+        startAliveCheck();
+        scheduleServiceAlarm();
+    }
+
+    private void scheduleServiceAlarm() {
+        AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
+        Intent intent = new Intent(this, KeepAliveService.class);
+        intent.setAction("ALARM_CHECK");
+        PendingIntent pi = PendingIntent.getService(this, 999, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 600000, pi);
+        } else {
+            am.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 600000, pi);
+        }
+    }
+
+    private void startAliveCheck() {
+        aliveCheckHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!isRunning) return;
+
+                boolean wsNull = (webSocket == null);
+                boolean stale = (lastPongTime > 0 && System.currentTimeMillis() - lastPongTime > 120000);
+
+                if ((wsNull || stale) && !isConnecting) {
+                    Log.d(TAG, "Alive check: WS " + (wsNull ? "null" : "stale") + ", reconnecting...");
+                    if (webSocket != null) {
+                        try { webSocket.close(1000, "stale"); } catch (Exception ignored) {}
+                        webSocket = null;
+                    }
+                    reconnectDelay = 1000;
+                    connectWebSocket();
+                }
+                if (isRunning) aliveCheckHandler.postDelayed(this, ALIVE_CHECK_INTERVAL);
+            }
+        }, ALIVE_CHECK_INTERVAL);
+    }
+
+    private void registerNetworkCallback() {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        NetworkRequest request = new NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build();
+        networkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(Network network) {
+                Log.d(TAG, "Network available — reconnecting");
+                reconnectDelay = 1000;
+                reconnectHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (isRunning && (webSocket == null)) connectWebSocket();
+                    }
+                }, 2000);
+            }
+            @Override
+            public void onLost(Network network) {
+                Log.d(TAG, "Network lost");
+            }
+        };
+        cm.registerNetworkCallback(request, networkCallback);
+    }
+
+    private void createChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager nm = getSystemService(NotificationManager.class);
+
+            nm.deleteNotificationChannel("skychat_keepalive");
+            nm.deleteNotificationChannel("skychat_bg_v2");
+
+            NotificationChannel keepCh = new NotificationChannel(
+                CHANNEL_ID, "Background Service", NotificationManager.IMPORTANCE_MIN);
+            keepCh.setDescription("Keeps SkyChat connected for instant notifications");
+            keepCh.setShowBadge(false);
+            keepCh.enableVibration(false);
+            keepCh.enableLights(false);
+            keepCh.setSound(null, null);
+            keepCh.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
+            nm.createNotificationChannel(keepCh);
+
+            NotificationChannel callCh = new NotificationChannel(
+                CHANNEL_CALL, "Incoming Calls", NotificationManager.IMPORTANCE_HIGH);
+            callCh.setDescription("Incoming voice and video calls");
+            callCh.enableVibration(true);
+            callCh.setVibrationPattern(new long[]{0, 1000, 500, 1000, 500, 1000});
+            callCh.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+            callCh.enableLights(true);
+            callCh.setLightColor(Color.GREEN);
+            nm.createNotificationChannel(callCh);
+
+            NotificationChannel msgCh = new NotificationChannel(
+                CHANNEL_MSG, "Messages", NotificationManager.IMPORTANCE_HIGH);
+            msgCh.setDescription("New message notifications");
+            msgCh.enableVibration(true);
+            msgCh.setVibrationPattern(new long[]{0, 250, 100, 250});
+            msgCh.enableLights(true);
+            msgCh.setLightColor(Color.WHITE);
+            nm.createNotificationChannel(msgCh);
+        }
+    }
+
+    private void connectWebSocket() {
+        if (isConnecting) {
+            Log.d(TAG, "Already connecting, skip");
+            return;
+        }
+
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String token = prefs.getString("token", null);
+        String refreshToken = prefs.getString("refresh_token", null);
+        int userId = prefs.getInt("user_id", -1);
+
+        if (token == null || userId == -1) {
+            Log.d(TAG, "No token/userId saved, waiting...");
+            reconnectHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (isRunning) connectWebSocket();
+                }
+            }, 5000);
+            return;
+        }
+
+        isConnecting = true;
+
+        if (refreshToken != null && !refreshToken.isEmpty()) {
+            refreshTokenAndConnect(refreshToken, userId);
+        } else {
+            doConnect(token, userId);
+        }
+    }
+
+    private void refreshTokenAndConnect(final String refreshToken, final int userId) {
+        OkHttpClient client = new OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .build();
+
+        okhttp3.MediaType JSON_TYPE = okhttp3.MediaType.parse("application/json; charset=utf-8");
+        String body = "{\"refresh\":\"" + refreshToken + "\"}";
+        okhttp3.RequestBody reqBody = okhttp3.RequestBody.create(body, JSON_TYPE);
+
+        // ✅ FIXED: skyfinancia.com use kiya
+        Request req = new Request.Builder()
+            .url(BASE_URL + "/api/auth/token/refresh/")
+            .post(reqBody)
+            .build();
+
+        client.newCall(req).enqueue(new okhttp3.Callback() {
+            @Override
+            public void onFailure(okhttp3.Call call, java.io.IOException e) {
+                Log.e(TAG, "Token refresh failed: " + e.getMessage());
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                String oldToken = prefs.getString("token", "");
+                doConnect(oldToken, userId);
+            }
+
+            @Override
+            public void onResponse(okhttp3.Call call, okhttp3.Response response) throws java.io.IOException {
+                try {
+                    String resBody = response.body().string();
+                    if (response.isSuccessful()) {
+                        JSONObject json = new JSONObject(resBody);
+                        String newToken = json.getString("access");
+                        Log.d(TAG, "Token refreshed successfully");
+                        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                        prefs.edit().putString("token", newToken).apply();
+                        doConnect(newToken, userId);
+                    } else {
+                        Log.e(TAG, "Token refresh HTTP " + response.code());
+                        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                        String oldToken = prefs.getString("token", "");
+                        doConnect(oldToken, userId);
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Token refresh parse error: " + e.getMessage());
+                    SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                    doConnect(prefs.getString("token", ""), userId);
+                }
+            }
+        });
+    }
+
+    private void doConnect(String token, int userId) {
+        if (!isRunning) { isConnecting = false; return; }
+
+        // ✅ FIXED: skyfinancia.com wala WS_BASE use ho raha hai
+        String url = WS_BASE + "user_" + userId + "/?token=" + token;
+        Log.d(TAG, "Connecting WS: user_" + userId);
+
+        if (webSocket != null) {
+            try { webSocket.close(1000, "new connection"); } catch (Exception ignored) {}
+            webSocket = null;
+        }
+
+        if (httpClient != null) {
+            httpClient.dispatcher().cancelAll();
+        }
+
+        httpClient = new OkHttpClient.Builder()
+            .readTimeout(60, TimeUnit.SECONDS)
+            .pingInterval(25, TimeUnit.SECONDS)
+            .build();
+
+        Request request = new Request.Builder().url(url).build();
+
+        webSocket = httpClient.newWebSocket(request, new WebSocketListener() {
+            @Override
+            public void onOpen(WebSocket ws, Response response) {
+                Log.d(TAG, "WebSocket CONNECTED to skyfinancia.com");
+                isConnecting = false;
+                reconnectDelay = 3000;
+                lastPongTime = System.currentTimeMillis();
+            }
+
+            @Override
+            public void onMessage(WebSocket ws, String text) {
+                handleMessage(text);
+            }
+
+            @Override
+            public void onClosing(WebSocket ws, int code, String reason) {
+                Log.d(TAG, "WS closing: " + code + " " + reason);
+                ws.close(1000, null);
+                webSocket = null;
+                isConnecting = false;
+                scheduleReconnect();
+            }
+
+            @Override
+            public void onFailure(WebSocket ws, Throwable t, Response response) {
+                Log.e(TAG, "WS failed: " + (t != null ? t.getMessage() : "unknown"));
+                webSocket = null;
+                isConnecting = false;
+                scheduleReconnect();
+            }
+        });
+    }
+
+    private void scheduleReconnect() {
+        if (!isRunning) return;
+        Log.d(TAG, "Reconnecting in " + reconnectDelay + "ms");
+        reconnectHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (isRunning) connectWebSocket();
+            }
+        }, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+    }
+
+    private void handleMessage(String text) {
+        try {
+            lastPongTime = System.currentTimeMillis();
+            JSONObject data = new JSONObject(text);
+            String type = data.optString("type", "");
+
+            if ("call_ended".equals(type) || "call_cancelled".equals(type) || "call_rejected".equals(type)) {
+                cancelCallNotification();
+                clearCallTimeout();
+                markCallHandled();
+                lastCallId = -1;
+                lastCallerId = -1;
+                stopRingtoneInWebView();
+                return;
+            }
+
+            if ("call_accepted".equals(type)) {
+                clearCallTimeout();
+                markCallHandled();
+                return;
+            }
+
+            if (MainActivity.isAppInForeground) return;
+
+            switch (type) {
+                case "call_incoming":
+                    int callId = data.optInt("call_id", -1);
+                    if (isCallHandled(callId)) {
+                        Log.d(TAG, "Call " + callId + " already handled, skipping notification");
+                        break;
+                    }
+                    lastCallId = callId;
+                    lastCallerId = data.optInt("caller_id", -1);
+                    setActiveCall(callId);
+                    SharedPreferences cp = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                    cp.edit()
+                        .putInt("pending_call_id", callId)
+                        .putInt("pending_caller_id", lastCallerId)
+                        .putString("pending_caller_name", data.optString("caller_name", "Unknown"))
+                        .putString("pending_call_type", data.optString("call_type", "voice"))
+                        .putString("pending_caller_username", data.optString("caller_username", ""))
+                        .putString("pending_caller_pic", data.optString("caller_profile_picture", ""))
+                        .putString("pending_call_json", text)
+                        .apply();
+                    showCallNotification(
+                        data.optString("caller_name", "Unknown"),
+                        data.optString("call_type", "voice").equals("video")
+                            ? "Incoming Video Call" : "Incoming Voice Call"
+                    );
+                    startCallTimeout();
+                    break;
+
+                case "group_call_notify": {
+                    String gName = safeStr(data, "group_name", "Group");
+                    String cName = safeStr(data, "caller_name", "Someone");
+                    String cType = data.optString("call_type", "voice").equals("video") ? "Video" : "Voice";
+                    showCallNotification(gName, cName + " \u2014 " + cType + " Call");
+                    startCallTimeout();
+                    break;
+                }
+
+                case "new_message_notify": {
+                    String senderName = safeStr(data, "sender_name", "Unknown");
+                    String groupName = safeStr(data, "group_name", "");
+                    String msgText = safeStr(data, "message", "New message");
+                    String title = groupName.isEmpty() ? senderName : senderName + " in " + groupName;
+                    showMessageNotification(title, msgText);
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Parse error: " + e.getMessage());
+        }
+    }
+
+    private String safeStr(JSONObject obj, String key, String fallback) {
+        if (obj.isNull(key)) return fallback;
+        String val = obj.optString(key, fallback);
+        if ("null".equals(val) || val.isEmpty()) return fallback;
+        return val;
+    }
+
+    private void showCallNotification(String callerName, String callType) {
+        Intent openIntent = new Intent(this, MainActivity.class);
+        openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent openPi = PendingIntent.getActivity(this, 100, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        Intent fullIntent = new Intent(this, MainActivity.class);
+        fullIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        fullIntent.putExtra("call_action", "show");
+        PendingIntent fullPi = PendingIntent.getActivity(this, 101, fullIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        Intent answerIntent = new Intent(this, MainActivity.class);
+        answerIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        answerIntent.putExtra("call_action", "answer");
+        answerIntent.putExtra("call_id", prefs.getInt("pending_call_id", -1));
+        answerIntent.putExtra("caller_id", prefs.getInt("pending_caller_id", -1));
+        answerIntent.putExtra("caller_name", prefs.getString("pending_caller_name", "Unknown"));
+        answerIntent.putExtra("call_type", prefs.getString("pending_call_type", "voice"));
+        answerIntent.putExtra("caller_pic", prefs.getString("pending_caller_pic", ""));
+        PendingIntent answerPi = PendingIntent.getActivity(this, 102, answerIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        Intent declineIntent = new Intent(this, CallActionReceiver.class);
+        declineIntent.setAction(CallActionReceiver.ACTION_DECLINE);
+        PendingIntent declinePi = PendingIntent.getBroadcast(this, 103, declineIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_CALL)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(callerName)
+            .setContentText(callType)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setContentIntent(openPi)
+            .setFullScreenIntent(fullPi, true)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setColor(Color.parseColor("#25D366"))
+            .setColorized(true)
+            .setVibrate(new long[]{0, 1000, 500, 1000, 500, 1000})
+            .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))
+            .addAction(new NotificationCompat.Action.Builder(
+                android.R.drawable.ic_menu_close_clear_cancel, "❌ Decline", declinePi).build())
+            .addAction(new NotificationCompat.Action.Builder(
+                android.R.drawable.ic_menu_call, "✅ Answer", answerPi).build());
+
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        nm.notify(CallActionReceiver.CALL_NOTIFICATION_ID, builder.build());
+    }
+
+    private void showMessageNotification(String senderName, String message) {
+        Intent openIntent = new Intent(this, MainActivity.class);
+        openIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent openPi = PendingIntent.getActivity(this, 200, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        Person sender = new Person.Builder()
+            .setName(senderName)
+            .setIcon(IconCompat.createWithResource(this, R.mipmap.ic_launcher))
+            .build();
+
+        NotificationCompat.MessagingStyle style = new NotificationCompat.MessagingStyle(
+            new Person.Builder().setName("Me").build()
+        );
+        style.setConversationTitle(senderName);
+        style.addMessage(message, System.currentTimeMillis(), sender);
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_MSG)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setLargeIcon(BitmapFactory.decodeResource(getResources(), R.mipmap.ic_launcher))
+            .setStyle(style)
+            .setSubText("SkyChat")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setContentIntent(openPi)
+            .setAutoCancel(true)
+            .setColor(Color.parseColor("#00a884"))
+            .setVibrate(new long[]{0, 250, 100, 250})
+            .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION))
+            .setGroup("skychat_messages");
+
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        nm.notify(senderName.hashCode(), builder.build());
+    }
+
+    private void cancelCallNotification() {
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        nm.cancel(CallActionReceiver.CALL_NOTIFICATION_ID);
+    }
+
+    private void startCallTimeout() {
+        clearCallTimeout();
+        callTimeoutRunnable = new Runnable() {
+            @Override
+            public void run() {
+                Log.d(TAG, "Call ring timeout — auto-dismissing");
+                cancelCallNotification();
+                markCallHandled();
+                if (webSocket != null && lastCallId != -1) {
+                    try {
+                        JSONObject msg = new JSONObject();
+                        msg.put("type", "call_reject");
+                        msg.put("call_id", lastCallId);
+                        msg.put("caller_id", lastCallerId);
+                        msg.put("reason", "no_answer");
+                        webSocket.send(msg.toString());
+                    } catch (Exception e) {
+                        Log.e(TAG, "Failed to send timeout reject: " + e.getMessage());
+                    }
+                }
+                lastCallId = -1;
+                lastCallerId = -1;
+                stopRingtoneInWebView();
+            }
+        };
+        reconnectHandler.postDelayed(callTimeoutRunnable, CALL_RING_TIMEOUT);
+    }
+
+    private void clearCallTimeout() {
+        if (callTimeoutRunnable != null) {
+            reconnectHandler.removeCallbacks(callTimeoutRunnable);
+            callTimeoutRunnable = null;
+        }
+    }
+
+    private void stopRingtoneInWebView() {
+        if (MainActivity.webViewRef != null) {
+            final android.webkit.WebView wv = MainActivity.webViewRef;
+            new Handler(Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    wv.evaluateJavascript(
+                        "(function(){" +
+                        "  if(typeof stopAllRingtones==='function') stopAllRingtones();" +
+                        "  if(typeof hideAllCallOverlays==='function') hideAllCallOverlays();" +
+                        "  if(typeof cleanupCall==='function') cleanupCall();" +
+                        "})()", null);
+                }
+            });
+        }
+    }
+
+    public void rejectCallViaWs() {
+        cancelCallNotification();
+        clearCallTimeout();
+        markCallHandled();
+        if (webSocket != null && lastCallId != -1) {
+            try {
+                JSONObject msg = new JSONObject();
+                msg.put("type", "call_reject");
+                msg.put("call_id", lastCallId);
+                msg.put("caller_id", lastCallerId);
+                msg.put("reason", "rejected");
+                webSocket.send(msg.toString());
+                Log.d(TAG, "Sent call_reject via WS");
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to send reject: " + e.getMessage());
+            }
+        }
+        lastCallId = -1;
+        lastCallerId = -1;
+        stopRingtoneInWebView();
+    }
+
+    private void setActiveCall(int callId) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        prefs.edit()
+            .putInt(PREF_ACTIVE_CALL_ID, callId)
+            .putBoolean(PREF_CALL_HANDLED, false)
+            .apply();
+    }
+
+    private void markCallHandled() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        prefs.edit().putBoolean(PREF_CALL_HANDLED, true).apply();
+    }
+
+    private boolean isCallHandled(int callId) {
+        if (callId == -1) return false;
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        int activeCallId = prefs.getInt(PREF_ACTIVE_CALL_ID, -1);
+        boolean handled = prefs.getBoolean(PREF_CALL_HANDLED, false);
+        return (callId == activeCallId && handled);
+    }
+
+    public void reconnect() {
+        isConnecting = false;
+        if (webSocket != null) {
+            try { webSocket.close(1000, "reconnecting"); } catch (Exception ignored) {}
+            webSocket = null;
+        }
+        reconnectDelay = 1000;
+        reconnectHandler.removeCallbacksAndMessages(null);
+        reconnectHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (isRunning) connectWebSocket();
+            }
+        }, 500);
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null) {
+            String action = intent.getAction();
+            if ("RECONNECT".equals(action)) {
+                reconnect();
+            } else if ("ALARM_CHECK".equals(action)) {
+                Log.d(TAG, "Alarm check fired — verifying WS");
+                if (webSocket == null && !isConnecting) {
+                    reconnectDelay = 1000;
+                    connectWebSocket();
+                }
+                scheduleServiceAlarm();
+            }
+        }
+        return START_STICKY;
+    }
+
+    @Override
+    public void onDestroy() {
+        Log.d(TAG, "Service destroyed");
+        instance = null;
+        isRunning = false;
+        isConnecting = false;
+        reconnectHandler.removeCallbacksAndMessages(null);
+        if (aliveCheckHandler != null) aliveCheckHandler.removeCallbacksAndMessages(null);
+        if (webSocket != null) webSocket.close(1000, "service stopped");
+        if (httpClient != null) httpClient.dispatcher().cancelAll();
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        if (networkCallback != null) {
+            try {
+                ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+                cm.unregisterNetworkCallback(networkCallback);
+            } catch (Exception ignored) {}
+        }
+        AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
+        Intent intent = new Intent(this, KeepAliveService.class);
+        intent.setAction("ALARM_CHECK");
+        PendingIntent pi = PendingIntent.getService(this, 999, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        am.cancel(pi);
+        super.onDestroy();
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        Log.d(TAG, "Task removed — scheduling restart");
+        super.onTaskRemoved(rootIntent);
+        AlarmManager am = (AlarmManager) getSystemService(ALARM_SERVICE);
+        Intent intent = new Intent(this, KeepAliveService.class);
+        PendingIntent pi = PendingIntent.getService(this, 998, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 5000, pi);
+        } else {
+            am.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + 5000, pi);
+        }
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+}

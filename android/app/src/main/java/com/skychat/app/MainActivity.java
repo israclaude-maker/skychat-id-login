@@ -1,0 +1,928 @@
+package com.skychat.app;
+
+import android.Manifest;
+import android.app.Activity;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.graphics.PixelFormat;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.VirtualDisplay;
+import android.media.AudioAttributes;
+import android.media.Image;
+import android.media.ImageReader;
+import android.media.RingtoneManager;
+import android.media.projection.MediaProjection;
+import android.media.projection.MediaProjectionManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.util.Log;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.provider.Settings;
+import android.util.Base64;
+import android.util.DisplayMetrics;
+import android.view.KeyEvent;
+import android.view.Window;
+import android.view.WindowManager;
+import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.webkit.PermissionRequest;
+
+import androidx.core.app.NotificationCompat;
+import androidx.core.app.Person;
+import androidx.core.graphics.drawable.IconCompat;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+
+import com.google.firebase.messaging.FirebaseMessaging;
+
+public class MainActivity extends Activity {
+
+    private static final String APP_URL = "https://skyfinancia.com/chat/";
+    private static final int PERMISSION_REQUEST_CODE = 1001;
+    private static final int FILE_CHOOSER_REQUEST = 1002;
+    private static final int SCREEN_CAPTURE_REQUEST = 1003;
+    private static final String CHANNEL_CALL = "skychat_calls";
+    private static final String CHANNEL_MSG = "skychat_messages";
+    private WebView webView;
+    public static WebView webViewRef = null; // for service to inject JS
+    private PermissionRequest pendingPermissionRequest;
+    private ValueCallback<Uri[]> fileUploadCallback;
+    private int msgNotifId = 2000;
+    public static boolean isAppInForeground = false;
+    private String pendingCallAction = null; // saved until WebView is ready
+    private Intent pendingCallIntent = null; // full intent with call data
+
+    // Screen capture fields
+    private MediaProjectionManager projectionManager;
+    private MediaProjection mediaProjection;
+    private VirtualDisplay virtualDisplay;
+    private ImageReader imageReader;
+    private Handler frameHandler;
+    private boolean isCapturing = false;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        requestWindowFeature(Window.FEATURE_NO_TITLE);
+        setContentView(com.skychat.app.R.layout.activity_main);
+
+        createNotificationChannels();
+
+        // Start foreground service to keep WebSocket alive in background
+        Intent serviceIntent = new Intent(this, KeepAliveService.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent);
+        } else {
+            startService(serviceIntent);
+        }
+
+        // Request battery optimization exemption (critical for Chinese OEM phones)
+        requestBatteryOptimizationExemption();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            String[] perms;
+            if (Build.VERSION.SDK_INT >= 33) {
+                perms = new String[]{
+                    Manifest.permission.RECORD_AUDIO,
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.MODIFY_AUDIO_SETTINGS,
+                    Manifest.permission.POST_NOTIFICATIONS
+                };
+            } else {
+                perms = new String[]{
+                    Manifest.permission.RECORD_AUDIO,
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.MODIFY_AUDIO_SETTINGS
+                };
+            }
+            boolean needRequest = false;
+            for (String p : perms) {
+                if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) {
+                    needRequest = true;
+                    break;
+                }
+            }
+            if (needRequest) {
+                requestPermissions(perms, PERMISSION_REQUEST_CODE);
+            }
+        }
+
+        webView = findViewById(com.skychat.app.R.id.webView);
+        webViewRef = webView;
+        webView.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null);
+
+        WebSettings settings = webView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        settings.setDatabaseEnabled(true);
+        settings.setAllowFileAccess(true);
+        settings.setJavaScriptCanOpenWindowsAutomatically(true);
+        settings.setAllowContentAccess(true);
+
+        CookieManager.getInstance().setAcceptCookie(true);
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+
+        webView.addJavascriptInterface(new WebAppInterface(), "AndroidBridge");
+
+        // Handle file downloads from WebView
+        webView.setDownloadListener(new android.webkit.DownloadListener() {
+            @Override
+            public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimetype, long contentLength) {
+                String fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimetype);
+                try {
+                    android.app.DownloadManager dm = (android.app.DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                    android.app.DownloadManager.Request request = new android.app.DownloadManager.Request(Uri.parse(url));
+                    request.setTitle(fileName);
+                    request.setDescription("Downloading from SkyChat");
+                    request.setNotificationVisibility(android.app.DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                    request.setDestinationInExternalPublicDir(android.os.Environment.DIRECTORY_DOWNLOADS, fileName);
+                    request.setMimeType(mimetype);
+                    request.allowScanningByMediaScanner();
+                    // Add cookies for auth
+                    String cookies = CookieManager.getInstance().getCookie(url);
+                    if (cookies != null) request.addRequestHeader("Cookie", cookies);
+                    dm.enqueue(request);
+                    Log.d("SkyChat", "WebView download: " + fileName);
+                } catch (Exception e) {
+                    Log.e("SkyChat", "Download error: " + e.getMessage());
+                    Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                    startActivity(i);
+                }
+            }
+        });
+
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+
+                // Hide registration/signup on login page
+                view.evaluateJavascript(
+                    "(function(){" +
+                    "  var sf=document.getElementById('signup-form'); if(sf) sf.style.display='none';" +
+                    "  var toggles=document.querySelectorAll('.form-toggle'); toggles.forEach(function(t){t.style.display='none';});" +
+                    "  var fn=window.toggleForms; window.toggleForms=function(){};" +
+                    "})()", null);
+
+                // Execute pending call action after page loads
+                if (pendingCallAction != null) {
+                    final String action = pendingCallAction;
+                    pendingCallAction = null;
+                    // Wait for JS to initialize, then try (with retries)
+                    view.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            executeCallAction(action);
+                        }
+                    }, 1000);
+                }
+            }
+        });
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onPermissionRequest(final PermissionRequest request) {
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            boolean hasMic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+                            boolean hasCam = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+                            if (!hasMic || !hasCam) {
+                                pendingPermissionRequest = request;
+                                requestPermissions(new String[]{
+                                    Manifest.permission.RECORD_AUDIO,
+                                    Manifest.permission.CAMERA,
+                                    Manifest.permission.MODIFY_AUDIO_SETTINGS
+                                }, PERMISSION_REQUEST_CODE);
+                                return;
+                            }
+                        }
+                        request.grant(request.getResources());
+                    }
+                });
+            }
+
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                if (fileUploadCallback != null) {
+                    fileUploadCallback.onReceiveValue(null);
+                }
+                fileUploadCallback = callback;
+                Intent intent = params.createIntent();
+                try {
+                    startActivityForResult(intent, FILE_CHOOSER_REQUEST);
+                } catch (Exception e) {
+                    fileUploadCallback = null;
+                    return false;
+                }
+                return true;
+            }
+        });
+
+        webView.loadUrl(APP_URL);
+
+        // Handle call action if app was launched from notification
+        Intent launchIntent = getIntent();
+        if (launchIntent != null && launchIntent.hasExtra("call_action")) {
+            pendingCallAction = launchIntent.getStringExtra("call_action");
+            pendingCallIntent = launchIntent;
+        }
+    }
+
+    private void requestBatteryOptimizationExemption() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            if (!pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                try {
+                    Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                } catch (Exception e) {
+                    Log.e("SkyChat", "Battery optimization request failed: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    private int callActionRetryCount = 0;
+    private static final int MAX_CALL_RETRIES = 8;
+
+    private void executeCallAction(String action) {
+        if (webView == null || action == null) return;
+
+        // Cancel notification immediately on any action
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        nm.cancel(CallActionReceiver.CALL_NOTIFICATION_ID);
+
+        if ("answer".equals(action)) {
+            callActionRetryCount = 0;
+            tryAnswerCall();
+        } else if ("decline".equals(action)) {
+            webView.evaluateJavascript(
+                "(function(){" +
+                "  if(typeof rejectCall==='function'){rejectCall();return 'ok';}" +
+                "  return 'no rejectCall';" +
+                "})()", null);
+        }
+        SharedPreferences prefs = getSharedPreferences(KeepAliveService.PREFS_NAME, MODE_PRIVATE);
+        prefs.edit().putBoolean("call_handled", true).apply();
+    }
+
+    private void tryAnswerCall() {
+        if (webView == null) return;
+
+        // First try: if incoming call overlay is already showing, just call acceptCall() directly
+        final String quickJs = "(function(){" +
+            "  if(typeof acceptCall==='undefined') return 'not_ready';" +
+            "  if(typeof CallState!=='undefined' && CallState.callId) {" +
+            "    acceptCall();" +
+            "    return 'accepted';" +
+            "  }" +
+            "  return 'no_call';" +
+            "})()";
+
+        webView.evaluateJavascript(quickJs, new android.webkit.ValueCallback<String>() {
+            @Override
+            public void onReceiveValue(String result) {
+                Log.d("SkyChat", "Quick accept result: " + result + " (attempt " + callActionRetryCount + ")");
+                if (result != null && result.contains("accepted")) {
+                    return; // Done!
+                }
+                // Fallback: inject call data
+                injectCallData();
+            }
+        });
+    }
+
+    private void injectCallData() {
+        SharedPreferences prefs = getSharedPreferences(KeepAliveService.PREFS_NAME, MODE_PRIVATE);
+        String callJson = prefs.getString("pending_call_json", null);
+
+        if (callJson != null) {
+            String base64 = Base64.encodeToString(callJson.getBytes(), Base64.NO_WRAP);
+            final String js = "(function(){" +
+                "  if(typeof CallState==='undefined' || typeof handleIncomingCall==='undefined') return 'not_ready';" +
+                "  try {" +
+                "    CallState.pendingAnswerFromNotification=true;" +
+                "    var data=JSON.parse(atob('" + base64 + "'));" +
+                "    handleIncomingCall(data);" +
+                "    return 'ok';" +
+                "  } catch(e) { return 'error:'+e.message; }" +
+                "})()";
+            webView.evaluateJavascript(js, new android.webkit.ValueCallback<String>() {
+                @Override
+                public void onReceiveValue(String result) {
+                    Log.d("SkyChat", "Inject result: " + result + " (attempt " + callActionRetryCount + ")");
+                    if (result != null && (result.contains("not_ready") || result.contains("null"))) {
+                        retryAnswerIfNeeded();
+                    }
+                }
+            });
+        } else {
+            int callId = prefs.getInt("pending_call_id", -1);
+            int callerId = prefs.getInt("pending_caller_id", -1);
+            String callerName = prefs.getString("pending_caller_name", "Unknown");
+            String callType = prefs.getString("pending_call_type", "voice");
+            String callerPic = prefs.getString("pending_caller_pic", "");
+
+            if (pendingCallIntent != null) {
+                callId = pendingCallIntent.getIntExtra("call_id", callId);
+                callerId = pendingCallIntent.getIntExtra("caller_id", callerId);
+                String n = pendingCallIntent.getStringExtra("caller_name");
+                if (n != null) callerName = n;
+                String t = pendingCallIntent.getStringExtra("call_type");
+                if (t != null) callType = t;
+                String p = pendingCallIntent.getStringExtra("caller_pic");
+                if (p != null) callerPic = p;
+                pendingCallIntent = null;
+            }
+            if (callerName == null) callerName = "Unknown";
+            if (callType == null) callType = "voice";
+            if (callerPic == null) callerPic = "";
+
+            final String js = "(function(){" +
+                "  if(typeof CallState==='undefined') return 'not_ready';" +
+                "  CallState.callId=" + callId + ";" +
+                "  CallState.callType='" + callType.replace("'", "\\'") + "';" +
+                "  CallState.remoteUserId=" + callerId + ";" +
+                "  CallState.remoteUserName='" + callerName.replace("'", "\\'") + "';" +
+                "  CallState.remoteProfilePic='" + callerPic.replace("'", "\\'") + "';" +
+                "  CallState.pendingAnswerFromNotification=true;" +
+                "  return 'ok';" +
+                "})()";
+            webView.evaluateJavascript(js, new android.webkit.ValueCallback<String>() {
+                @Override
+                public void onReceiveValue(String result) {
+                    Log.d("SkyChat", "Fallback result: " + result + " (attempt " + callActionRetryCount + ")");
+                    if (result != null && (result.contains("not_ready") || result.contains("null"))) {
+                        retryAnswerIfNeeded();
+                    }
+                }
+            });
+        }
+    }
+
+    private void retryAnswerIfNeeded() {
+        callActionRetryCount++;
+        if (callActionRetryCount < MAX_CALL_RETRIES) {
+            Log.d("SkyChat", "JS not ready, retrying in " + (callActionRetryCount * 500) + "ms...");
+            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    tryAnswerCall();
+                }
+            }, callActionRetryCount * 500); // 500ms, 1s, 1.5s, 2s...
+        } else {
+            Log.e("SkyChat", "Failed to inject call answer after " + MAX_CALL_RETRIES + " retries");
+        }
+    }
+
+    private void createNotificationChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager nm = getSystemService(NotificationManager.class);
+
+            // Delete old cached channel
+            nm.deleteNotificationChannel("skychat_keepalive");
+
+            // Call channel - HIGH importance, vibrate, ringtone sound
+            NotificationChannel callCh = new NotificationChannel(
+                CHANNEL_CALL, "Incoming Calls", NotificationManager.IMPORTANCE_HIGH);
+            callCh.setDescription("Incoming voice and video call alerts");
+            callCh.enableVibration(true);
+            callCh.setVibrationPattern(new long[]{0, 1000, 500, 1000, 500, 1000});
+            callCh.setLockscreenVisibility(android.app.Notification.VISIBILITY_PUBLIC);
+            callCh.enableLights(true);
+            callCh.setLightColor(Color.GREEN);
+            AudioAttributes callAudio = new AudioAttributes.Builder()
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                .build();
+            callCh.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE), callAudio);
+            nm.createNotificationChannel(callCh);
+
+            // Message channel - DEFAULT importance, notification sound
+            NotificationChannel msgCh = new NotificationChannel(
+                CHANNEL_MSG, "Messages", NotificationManager.IMPORTANCE_HIGH);
+            msgCh.setDescription("New message notifications");
+            msgCh.enableVibration(true);
+            msgCh.setVibrationPattern(new long[]{0, 250, 100, 250});
+            msgCh.enableLights(true);
+            msgCh.setLightColor(Color.WHITE);
+            msgCh.setLockscreenVisibility(android.app.Notification.VISIBILITY_PRIVATE);
+            nm.createNotificationChannel(msgCh);
+        }
+    }
+
+    private void registerFcmToken(final String authToken) {
+        FirebaseMessaging.getInstance().getToken()
+            .addOnSuccessListener(new com.google.android.gms.tasks.OnSuccessListener<String>() {
+                @Override
+                public void onSuccess(String fcmToken) {
+                    Log.d("SkyChat", "FCM token: " + fcmToken.substring(0, 20) + "...");
+                    SharedPreferences prefs = getSharedPreferences(KeepAliveService.PREFS_NAME, MODE_PRIVATE);
+                    prefs.edit().putString("fcm_token", fcmToken).apply();
+
+                    // Send to server in background
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                okhttp3.OkHttpClient client = new okhttp3.OkHttpClient();
+                                okhttp3.MediaType JSON = okhttp3.MediaType.parse("application/json; charset=utf-8");
+                                String body = "{\"token\":\"" + fcmToken + "\",\"device_type\":\"android\"}";
+                                okhttp3.Request request = new okhttp3.Request.Builder()
+                                    .url("https://skyfinancia.com/api/users/fcm_register/")
+                                    .header("Authorization", "Bearer " + authToken)
+                                    .post(okhttp3.RequestBody.create(body, JSON))
+                                    .build();
+                                okhttp3.Response response = client.newCall(request).execute();
+                                Log.d("SkyChat", "FCM token registered: " + response.code());
+                            } catch (Exception e) {
+                                Log.e("SkyChat", "FCM register failed: " + e.getMessage());
+                            }
+                        }
+                    }).start();
+                }
+            });
+    }
+
+    public class WebAppInterface {
+        @JavascriptInterface
+        public void saveCredentials(String token, int userId, String refreshToken) {
+            SharedPreferences prefs = getSharedPreferences(KeepAliveService.PREFS_NAME, MODE_PRIVATE);
+            prefs.edit()
+                .putString("token", token)
+                .putInt("user_id", userId)
+                .putString("refresh_token", refreshToken)
+                .apply();
+            // Tell service to reconnect with new token
+            Intent svc = new Intent(MainActivity.this, KeepAliveService.class);
+            svc.setAction("RECONNECT");
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(svc);
+            } else {
+                startService(svc);
+            }
+            // Register FCM token with server
+            registerFcmToken(token);
+        }
+
+        @JavascriptInterface
+        public void showCallNotification(String callerName, String callType) {
+            showCallNotif(callerName, callType);
+        }
+
+        @JavascriptInterface
+        public void showMessageNotification(String senderName, String message) {
+            showMessageNotif(senderName, message);
+        }
+
+        @JavascriptInterface
+        public void cancelCallNotification() {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            nm.cancel(CallActionReceiver.CALL_NOTIFICATION_ID);
+        }
+
+        @JavascriptInterface
+        public void cancelAllNotifications() {
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            nm.cancelAll();
+        }
+
+        @JavascriptInterface
+        public void downloadFile(String url, String filename) {
+            try {
+                android.app.DownloadManager dm = (android.app.DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                android.app.DownloadManager.Request request = new android.app.DownloadManager.Request(Uri.parse(url));
+                request.setTitle(filename);
+                request.setDescription("Downloading from SkyChat");
+                request.setNotificationVisibility(android.app.DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                request.setDestinationInExternalPublicDir(android.os.Environment.DIRECTORY_DOWNLOADS, filename);
+                request.allowScanningByMediaScanner();
+                dm.enqueue(request);
+                Log.d("SkyChat", "Download started: " + filename);
+            } catch (Exception e) {
+                Log.e("SkyChat", "Download failed: " + e.getMessage());
+                // Fallback: open in browser
+                Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                startActivity(browserIntent);
+            }
+        }
+
+        @JavascriptInterface
+        public void vibrate(long ms) {
+            Vibrator v = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+            if (v != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE));
+                } else {
+                    v.vibrate(ms);
+                }
+            }
+        }
+
+        @JavascriptInterface
+        public boolean isBackground() {
+            return !isAppInForeground;
+        }
+
+        @JavascriptInterface
+        public void startScreenCapture() {
+            Log.d("SkyChat", "startScreenCapture called from JS");
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+                        startActivityForResult(projectionManager.createScreenCaptureIntent(), SCREEN_CAPTURE_REQUEST);
+                    } catch (Exception e) {
+                        Log.e("SkyChat", "startScreenCapture error", e);
+                        if (webView != null) {
+                            webView.evaluateJavascript(
+                                "if(window._screenReject){window._screenReject('Launch failed');}", null);
+                        }
+                    }
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void stopScreenCapture() {
+            Log.d("SkyChat", "stopScreenCapture called from JS");
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    stopCapture();
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void logout() {
+            SharedPreferences prefs = getSharedPreferences(KeepAliveService.PREFS_NAME, MODE_PRIVATE);
+            prefs.edit().clear().apply();
+            // Stop the service on logout
+            stopService(new Intent(MainActivity.this, KeepAliveService.class));
+        }
+    }
+
+    // ── WhatsApp-style CALL notification with Answer/Decline ──
+    private void showCallNotif(String callerName, String callType) {
+        // Open app when tapping notification body
+        Intent openIntent = new Intent(this, MainActivity.class);
+        openIntent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent openPi = PendingIntent.getActivity(this, 0, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        // Full-screen intent (shows on lock screen like WhatsApp call)
+        Intent fullIntent = new Intent(this, MainActivity.class);
+        fullIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        fullIntent.putExtra("call_action", "show");
+        PendingIntent fullPi = PendingIntent.getActivity(this, 1, fullIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        // Answer button
+        Intent answerIntent = new Intent(this, CallActionReceiver.class);
+        answerIntent.setAction(CallActionReceiver.ACTION_ANSWER);
+        PendingIntent answerPi = PendingIntent.getBroadcast(this, 2, answerIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        // Decline button
+        Intent declineIntent = new Intent(this, CallActionReceiver.class);
+        declineIntent.setAction(CallActionReceiver.ACTION_DECLINE);
+        PendingIntent declinePi = PendingIntent.getBroadcast(this, 3, declineIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        Bitmap largeIcon = BitmapFactory.decodeResource(getResources(), R.mipmap.ic_launcher);
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_CALL)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setLargeIcon(largeIcon)
+            .setContentTitle(callerName)
+            .setContentText(callType)
+            .setSubText("SkyChat")
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setContentIntent(openPi)
+            .setFullScreenIntent(fullPi, true)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setColor(Color.parseColor("#00a884"))
+            .setVibrate(new long[]{0, 1000, 500, 1000, 500, 1000})
+            .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Decline", declinePi)
+            .addAction(android.R.drawable.ic_menu_call, "Answer", answerPi);
+
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        nm.notify(CallActionReceiver.CALL_NOTIFICATION_ID, builder.build());
+    }
+
+    // ── WhatsApp-style MESSAGE notification ──
+    private void showMessageNotif(String senderName, String message) {
+        Intent openIntent = new Intent(this, MainActivity.class);
+        openIntent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent openPi = PendingIntent.getActivity(this, 10, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        Bitmap largeIcon = BitmapFactory.decodeResource(getResources(), R.mipmap.ic_launcher);
+
+        Person sender = new Person.Builder()
+            .setName(senderName)
+            .setIcon(IconCompat.createWithResource(MainActivity.this, R.mipmap.ic_launcher))
+            .build();
+
+        NotificationCompat.MessagingStyle style = new NotificationCompat.MessagingStyle(
+            new Person.Builder().setName("Me").build()
+        );
+        style.setConversationTitle(senderName);
+        style.addMessage(message, System.currentTimeMillis(), sender);
+
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, CHANNEL_MSG)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setLargeIcon(largeIcon)
+            .setContentTitle(senderName)
+            .setContentText(message)
+            .setStyle(style)
+            .setSubText("SkyChat")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setContentIntent(openPi)
+            .setAutoCancel(true)
+            .setColor(Color.parseColor("#00a884"))
+            .setVibrate(new long[]{0, 250, 100, 250})
+            .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION))
+            .setGroup("skychat_messages")
+            .setGroupSummary(false);
+
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        // Use senderName hashCode for grouping per sender
+        nm.notify(senderName.hashCode(), builder.build());
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+
+        // Screen capture result
+        if (requestCode == SCREEN_CAPTURE_REQUEST) {
+            Log.d("SkyChat", "Screen capture result: " + resultCode);
+            if (resultCode == RESULT_OK && data != null) {
+                // Start foreground service first (required for Android 10+)
+                Intent svc = new Intent(MainActivity.this, ScreenCaptureService.class);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(svc);
+                } else {
+                    startService(svc);
+                }
+                // Delay to ensure service is running before creating projection
+                final int rc = resultCode;
+                final Intent rd = new Intent(data);
+                webView.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            Log.d("SkyChat", "Creating MediaProjection...");
+                            mediaProjection = projectionManager.getMediaProjection(rc, rd);
+                            if (mediaProjection != null) {
+                                Log.d("SkyChat", "MediaProjection created OK");
+                                startFrameCapture();
+                            } else {
+                                Log.e("SkyChat", "MediaProjection is null!");
+                                webView.evaluateJavascript(
+                                    "if(window._screenReject){window._screenReject('projection null');}", null);
+                            }
+                        } catch (Exception e) {
+                            Log.e("SkyChat", "MediaProjection error", e);
+                            webView.evaluateJavascript(
+                                "if(window._screenReject){window._screenReject('Failed: " + e.getMessage().replace("'", "") + "');}", null);
+                        }
+                    }
+                }, 500);
+            } else {
+                // User denied
+                if (webView != null) {
+                    webView.evaluateJavascript(
+                        "if(window._screenReject){window._screenReject('denied');window._screenReject=null;}",
+                        null);
+                }
+            }
+            return;
+        }
+
+        // File chooser result
+        if (requestCode == FILE_CHOOSER_REQUEST && fileUploadCallback != null) {
+            Uri[] results = null;
+            if (resultCode == RESULT_OK && data != null && data.getDataString() != null) {
+                results = new Uri[]{Uri.parse(data.getDataString())};
+            }
+            fileUploadCallback.onReceiveValue(results);
+            fileUploadCallback = null;
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == PERMISSION_REQUEST_CODE && pendingPermissionRequest != null) {
+            final PermissionRequest req = pendingPermissionRequest;
+            pendingPermissionRequest = null;
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    req.grant(req.getResources());
+                }
+            });
+        }
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
+            webView.goBack();
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+
+    
+
+
+@Override
+protected void onPause() {
+    isAppInForeground = false;
+    // WebView ko background mein alive rakho
+    if (webView != null) {
+        webView.onPause();        // rendering rokta hai (battery save)
+        webView.pauseTimers();    // JS timers temporarily pause
+    }
+    super.onPause();
+}
+
+@Override
+protected void onResume() {
+    super.onResume();
+    isAppInForeground = true;
+    if (webView != null) {
+        webView.onResume();
+        webView.resumeTimers();
+    }
+    // ✅ YAHAN YEH LIKHO
+    NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+    nm.cancel(0);
+}
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // Handle call answer/decline from notification
+        if (intent != null && intent.hasExtra("call_action")) {
+            String action = intent.getStringExtra("call_action");
+            pendingCallIntent = intent;
+            if ("answer".equals(action) || "decline".equals(action)) {
+                executeCallAction(action);
+            }
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        stopCapture();
+        // Do NOT stop KeepAlive service — it should keep running for notifications
+        super.onDestroy();
+    }
+
+    // ── Screen Capture Methods ──
+    private void startFrameCapture() {
+        if (mediaProjection == null) {
+            Log.e("SkyChat", "mediaProjection is null!");
+            return;
+        }
+        Log.d("SkyChat", "Starting frame capture...");
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        float ratio = (float) metrics.heightPixels / metrics.widthPixels;
+        int w = 720;
+        int h = (int) (720 * ratio);
+        int dpi = metrics.densityDpi;
+
+        imageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
+        virtualDisplay = mediaProjection.createVirtualDisplay(
+            "SkyChat-Screen", w, h, dpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader.getSurface(), null, null);
+
+        isCapturing = true;
+        frameHandler = new Handler(Looper.getMainLooper());
+        Log.d("SkyChat", "Frame capture started, resolution: " + w + "x" + h);
+        scheduleFrameCapture();
+    }
+
+    private void scheduleFrameCapture() {
+        if (!isCapturing || frameHandler == null) return;
+        frameHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                captureFrame();
+                scheduleFrameCapture();
+            }
+        }, 80); // ~12fps
+    }
+
+    private void captureFrame() {
+        if (!isCapturing || imageReader == null || webView == null) return;
+        Image image = imageReader.acquireLatestImage();
+        if (image == null) return;
+
+        try {
+            Image.Plane[] planes = image.getPlanes();
+            ByteBuffer buffer = planes[0].getBuffer();
+            int pixelStride = planes[0].getPixelStride();
+            int rowStride = planes[0].getRowStride();
+            int imgW = image.getWidth();
+            int imgH = image.getHeight();
+            int rowPadding = rowStride - pixelStride * imgW;
+
+            Bitmap bitmap = Bitmap.createBitmap(
+                imgW + rowPadding / pixelStride, imgH, Bitmap.Config.ARGB_8888);
+            bitmap.copyPixelsFromBuffer(buffer);
+
+            if (rowPadding > 0) {
+                Bitmap cropped = Bitmap.createBitmap(bitmap, 0, 0, imgW, imgH);
+                bitmap.recycle();
+                bitmap = cropped;
+            }
+
+            // Scale down for performance
+            if (bitmap.getWidth() > 720) {
+                float s = 720f / bitmap.getWidth();
+                Bitmap scaled = Bitmap.createScaledBitmap(bitmap, 720, (int)(bitmap.getHeight() * s), false);
+                bitmap.recycle();
+                bitmap = scaled;
+            }
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 55, baos);
+            bitmap.recycle();
+
+            final String base64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    if (webView != null) {
+                        webView.evaluateJavascript(
+                            "if(window._onScreenFrame){window._onScreenFrame('data:image/jpeg;base64," + base64 + "');}",
+                            null);
+                    }
+                }
+            });
+        } catch (Exception e) {
+            Log.e("SkyChat", "captureFrame error", e);
+        } finally {
+            image.close();
+        }
+    }
+
+    private void stopCapture() {
+        isCapturing = false;
+        if (frameHandler != null) {
+            frameHandler.removeCallbacksAndMessages(null);
+            frameHandler = null;
+        }
+        if (virtualDisplay != null) {
+            virtualDisplay.release();
+            virtualDisplay = null;
+        }
+        if (imageReader != null) {
+            imageReader.close();
+            imageReader = null;
+        }
+        if (mediaProjection != null) {
+            mediaProjection.stop();
+            mediaProjection = null;
+        }
+        try {
+            stopService(new Intent(this, ScreenCaptureService.class));
+        } catch (Exception e) { /* ignore */ }
+    }
+}
