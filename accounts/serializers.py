@@ -14,8 +14,11 @@ class UserSerializer(serializers.ModelSerializer):
             "is_online",
             "last_seen",
             "profile_picture",
+            "rc_id",
         )
-        read_only_fields = ("id",)
+
+
+read_only_fields = ("id", "rc_id")
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -71,6 +74,3 @@ class RegisterSerializer(serializers.ModelSerializer):
 class LoginSerializer(serializers.Serializer):
     username = serializers.CharField()
     password = serializers.CharField(write_only=True)
-
-
-

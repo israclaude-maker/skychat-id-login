@@ -158,6 +158,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
             await self.handle_remote_control_event(data)
         elif message_type == "remote_control_stop":
             await self.handle_remote_control_stop(data)
+        elif message_type == "rc_id_connect_request":
+            await self.handle_rc_id_connect_request(data)
+        elif message_type == "rc_screen_offer":
+            await self.handle_rc_screen_offer(data)
+        elif message_type == "rc_screen_answer":
+            await self.handle_rc_screen_answer(data)
+        elif message_type == "rc_screen_ice":
+            await self.handle_rc_screen_ice(data)
 
     async def handle_chat_message(self, data):
         message = data["message"]
@@ -294,8 +302,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     "timestamp": djtz.now().isoformat(),
                 },
             )
-            
+
             # handle_remote_control_event — replace karo
+
     async def handle_remote_control_event(self, data):
         target_id = data.get("target_user_id")
         await self.channel_layer.group_send(
@@ -1237,9 +1246,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
         )
 
     # Group call DB helpers
-    
+
     @database_sync_to_async
-    
     def create_group_call(self, group_id, call_type):
         try:
             group = Group.objects.get(id=group_id)
@@ -1738,6 +1746,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     "type": "remote_control_request",
                     "requester_id": event["requester_id"],
                     "requester_name": event["requester_name"],
+                    "requester_pic": event.get("requester_pic"),
+                    "source": event.get("source", "call"),
                 }
             )
         )
@@ -1785,6 +1795,135 @@ class ChatConsumer(AsyncWebsocketConsumer):
             text_data=json.dumps(
                 {
                     "type": "remote_control_stop",
+                }
+            )
+        )
+
+    async def handle_rc_id_connect_request(self, data):
+        target_rc_id = data.get("target_rc_id")
+        target_user_id = await self.get_user_id_by_rc_id(target_rc_id)
+
+        if not target_user_id:
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "rc_id_not_found",
+                        "rc_id": target_rc_id,
+                    }
+                )
+            )
+            return
+
+        if target_user_id == self.user.id:
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "rc_id_error",
+                        "message": "Apni khud ki ID use nahi kar sakte",
+                    }
+                )
+            )
+            return
+
+        requester_name = (
+            f"{self.user.first_name} {self.user.last_name}".strip()
+            or self.user.username
+        )
+        requester_pic = (
+            self.user.profile_picture.url if self.user.profile_picture else None
+        )
+
+        await self.channel_layer.group_send(
+            f"user_{target_user_id}",
+            {
+                "type": "remote_control_incoming",
+                "requester_id": self.user.id,
+                "requester_name": requester_name,
+                "requester_pic": requester_pic,
+                "source": "rc_id",
+            },
+        )
+
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "rc_id_request_sent",
+                    "target_user_id": target_user_id,
+                }
+            )
+        )
+
+    @database_sync_to_async
+    def get_user_id_by_rc_id(self, rc_id):
+        try:
+            return User.objects.get(rc_id=rc_id).id
+        except User.DoesNotExist:
+            return None
+
+    # ═══ STANDALONE RC (RC-ID) SCREEN SIGNALING ═══
+
+    async def handle_rc_screen_offer(self, data):
+        target_id = data.get("target_user_id")
+        await self.channel_layer.group_send(
+            f"user_{target_id}",
+            {
+                "type": "rc_screen_offer_relay",
+                "from_user_id": self.user.id,
+                "sdp": data.get("sdp"),
+            },
+        )
+
+    async def rc_screen_offer_relay(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "rc_screen_offer",
+                    "from_user_id": event["from_user_id"],
+                    "sdp": event["sdp"],
+                }
+            )
+        )
+
+    async def handle_rc_screen_answer(self, data):
+        target_id = data.get("target_user_id")
+        await self.channel_layer.group_send(
+            f"user_{target_id}",
+            {
+                "type": "rc_screen_answer_relay",
+                "from_user_id": self.user.id,
+                "sdp": data.get("sdp"),
+            },
+        )
+
+    async def rc_screen_answer_relay(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "rc_screen_answer",
+                    "from_user_id": event["from_user_id"],
+                    "sdp": event["sdp"],
+                }
+            )
+        )
+
+    async def handle_rc_screen_ice(self, data):
+        target_id = data.get("target_user_id")
+        await self.channel_layer.group_send(
+            f"user_{target_id}",
+            {
+                "type": "rc_screen_ice_relay",
+                "from_user_id": self.user.id,
+                "candidate": data.get("candidate"),
+            },
+        )
+
+    async def rc_screen_ice_relay(self, event):
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "rc_screen_ice",
+                    "from_user_id": event["from_user_id"],
+                    "candidate": event["candidate"],
                 }
             )
         )

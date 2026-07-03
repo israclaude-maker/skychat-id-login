@@ -14,6 +14,19 @@ class CustomUser(AbstractUser):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     activation_token = models.UUIDField(default=uuid.uuid4, null=True, blank=True)
+    rc_id = models.CharField(max_length=11, unique=True, blank=True, default="")
+
+    def save(self, *args, **kwargs):
+        if not self.rc_id:
+            import random, string
+
+            while True:
+                digits = "".join(random.choices(string.digits, k=9))
+                new_id = f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+                if not CustomUser.objects.filter(rc_id=new_id).exists():
+                    self.rc_id = new_id
+                    break
+        super().save(*args, **kwargs)
 
     class Meta:
         ordering = ["-created_at"]

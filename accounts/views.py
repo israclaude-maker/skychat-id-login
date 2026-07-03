@@ -2405,3 +2405,31 @@ class MessageViewSet(viewsets.ViewSet):
             return Response(
                 {"error": "Message not found"}, status=status.HTTP_404_NOT_FOUND
             )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="lookup_rc/(?P<rc_id>[^/.]+)",
+        permission_classes=[IsAuthenticated],
+    )
+    def lookup_by_rc_id(self, request, rc_id=None):
+        try:
+            user = CustomUser.objects.get(rc_id=rc_id)
+            if user == request.user:
+                return Response(
+                    {"error": "Apni khud ki RC ID use nahi kar sakte"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            return Response({
+                "id": user.id,
+                "username": user.username,
+                "display_name": f"{user.first_name} {user.last_name}".strip() or user.username,
+                "profile_picture": user.profile_picture.url if user.profile_picture else None,
+                "is_online": user.is_online,
+                "rc_id": user.rc_id,
+            })
+        except CustomUser.DoesNotExist:
+            return Response(
+                {"error": "Koi user is RC ID se nahi mila"},
+                status=status.HTTP_404_NOT_FOUND,
+            )

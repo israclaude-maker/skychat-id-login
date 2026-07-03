@@ -11817,4 +11817,99 @@ function keepAudioContextAlive() {
   }
 }
 
+// ==================== SCREEN RECORDING (Top Bar) ====================
+var ScreenRec = {
+  isRecording: false,
+  mediaRecorder: null,
+  chunks: [],
+  stream: null,
+  startTime: null,
+  timerInterval: null,
+};
+
+function toggleScreenRecord() {
+  if (ScreenRec.isRecording) {
+    stopScreenRecord();
+  } else {
+    startScreenRecord();
+  }
+}
+
+async function startScreenRecord() {
+  if (ScreenRec.isRecording) return;
+
+  try {
+    ScreenRec.stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true,
+    });
+
+    ScreenRec.chunks = [];
+    ScreenRec.isRecording = true;
+    ScreenRec.startTime = Date.now();
+
+    const options = { mimeType: "video/webm;codecs=vp9,opus" };
+    ScreenRec.mediaRecorder = new MediaRecorder(ScreenRec.stream, options);
+
+    ScreenRec.mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) ScreenRec.chunks.push(e.data);
+    };
+
+    ScreenRec.mediaRecorder.onstop = () => {
+      const blob = new Blob(ScreenRec.chunks, { type: "video/webm" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `SkyChat_Recording_${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.webm`;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      ScreenRec.stream.getTracks().forEach((track) => track.stop());
+      ScreenRec.isRecording = false;
+      document.getElementById("screen-rec-top-btn").style.color = "";
+      toast("Recording saved!", "s");
+    };
+
+    ScreenRec.mediaRecorder.start();
+    document.getElementById("screen-rec-top-btn").style.color = "#ef4444";
+    toast("Screen recording started...", "s");
+  } catch (err) {
+    toast("Screen recording permission denied", "e");
+    console.error(err);
+  }
+}
+
+function stopScreenRecord() {
+  if (ScreenRec.mediaRecorder) {
+    ScreenRec.mediaRecorder.stop();
+  }
+  if (ScreenRec.stream) {
+    ScreenRec.stream.getTracks().forEach((track) => track.stop());
+  }
+  ScreenRec.isRecording = false;
+  document.getElementById("screen-rec-top-btn").style.color = "";
+  toast("Recording stopped", "i");
+}
+
+// ==================== RC ID BASED REMOTE CONTROL (AnyDesk Style) ====================
+function startRemoteControlByRCID() {
+  var rcId = prompt("Enter target's RC ID:");
+  if (!rcId || rcId.trim() === "") return;
+
+  rcId = rcId.trim();
+
+  var ws = S.globalWs || S.ws;
+  if (ws && ws.readyState === 1) {
+    ws.send(
+      JSON.stringify({
+        type: "rc_id_connect_request",
+        rc_id: rcId,
+        requester_name: S.user.first_name || S.user.username,
+      }),
+    );
+    toast("Remote control request sent to RC ID: " + rcId, "i");
+  } else {
+    toast("Not connected to server", "e");
+  }
+}
 init();

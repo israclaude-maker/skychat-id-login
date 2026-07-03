@@ -406,6 +406,26 @@ app.on("window-all-closed", () => {
 
 const robot = require("@jitsi/robotjs");
 
+// ─── Standalone RC (RC-ID based): get screen source id ────────
+// Used by chat.js when a user ACCEPTS an incoming RC-ID request.
+// Auto-selects the primary/entire screen — no picker shown, since
+// this is a consensual pre-approved control session (not a share).
+ipcMain.handle("get-screen-source", async () => {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ["screen"],
+      thumbnailSize: { width: 1, height: 1 },
+    });
+    if (sources.length > 0) {
+      return { id: sources[0].id, name: sources[0].name };
+    }
+    return null;
+  } catch (err) {
+    console.error("[RC] get-screen-source error:", err);
+    return null;
+  }
+});
+
 // ─── Key name mapping for robotjs ────────────────────────────
 const keyMap = {
   // Navigation keys

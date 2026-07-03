@@ -30,8 +30,12 @@ contextBridge.exposeInMainWorld("DesktopBridge", {
   flashWindow: () => ipcRenderer.send("flash-window"),
   setBadgeCount: (count) => ipcRenderer.send("set-badge-count", count),
 
-  // Remote Control
+  // Remote Control (in-call, video-element based)
   sendRCEvent: (data) => ipcRenderer.send("rc-event", data),
+
+  // Standalone Remote Control (RC-ID based, no call needed)
+  // Returns { id, name } of the primary screen source, or null.
+  getScreenSource: () => ipcRenderer.invoke("get-screen-source"),
 
   // Callbacks from main process
   onCallAction: (callback) => {
